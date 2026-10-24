@@ -3,13 +3,15 @@
 PDF Cleaner - gỡ logo chìm, header, footer, vùng tùy chọn khỏi PDF
 (giữ nguyên PDF, hỗ trợ cả PDF scan mà mỗi trang là một ảnh).
 
-Cài đặt:   pip install pymupdf customtkinter
+Cài đặt:   pip install pymupdf customtkinter pillow tkinterdnd2
+           (tkinterdnd2 chỉ để kéo thả file; thiếu vẫn chạy, chỉ không kéo thả được)
 Chạy:      python pdf_cleaner.py
 Linux:     sudo apt install python3-tk
 """
 import os
 import queue
 import re
+import string
 import subprocess
 import sys
 import threading
@@ -20,12 +22,19 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image, ImageStat, ImageTk
+from PIL import Image, ImageDraw, ImageStat, ImageTk
 
 try:
     import pymupdf as fitz  # PyMuPDF >= 1.24.3
 except ImportError:  # bản cũ hơn
     import fitz
+
+try:  # kéo thả file/thư mục vào cửa sổ
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+except Exception:
+    DND_FILES = TkinterDnD = None
+    HAS_DND = False
 
 # ----------------------------------------------------------------------------
 # LÕI XỬ LÝ
@@ -356,10 +365,12 @@ SCOPES = {
     "Khoảng trang…": "range",
 }
 MODES = {"Tự động": "auto", "Theo %": "manual", "Tắt": "none"}
+FILE_SCOPES = {"Chỉ file này": "this", "Mọi file": "all", "Chọn file…": "pick"}
 
 
-def font(size=13, bold=False):
-    return ctk.CTkFont(family=FONT_FAMILY, size=size, weight="bold" if bold else "normal")
+def font(size=13, bold=False, underline=False):
+    return ctk.CTkFont(family=FONT_FAMILY, size=size, weight="bold" if bold else "normal",
+                       underline=underline)
 
 
 def btn_primary(parent, text, command, **kw):
@@ -403,6 +414,490 @@ def open_folder(path):
             subprocess.Popen(["xdg-open", path])
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------------------
+# NHẬP / XUẤT: vùng thả file, hộp chọn thư mục (có tạo thư mục mới)
+# ----------------------------------------------------------------------------
+
+if HAS_DND:
+    class _Root(ctk.CTk, TkinterDnD.DnDWrapper):
+        """Cửa sổ chính có hỗ trợ kéo thả (nếu tkdnd chạy được trên máy)."""
+        dnd_ok = False
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self.dnd_ok = True
+            except Exception:
+                self.dnd_ok = False
+else:
+    class _Root(ctk.CTk):
+        dnd_ok = False
+
+
+def file_size_text(path):
+    try:
+        n = os.path.getsize(path)
+    except OSError:
+        return ""
+    if n < 1024 * 1024:
+        return f"{max(1, n // 1024)} KB"
+    return f"{n / 1048576:.1f} MB"
+
+
+def shorten(text, n=52):
+    return text if len(text) <= n else "…" + text[-(n - 1):]
+
+
+def default_places():
+    """Các vị trí hay dùng, hiện ở cột trái hộp chọn thư mục."""
+    home = Path.home()
+    out = [("Thư mục nhà", home)]
+    for label, name in (("Màn hình nền", "Desktop"), ("Tài liệu", "Documents"),
+                        ("Tải xuống", "Downloads")):
+        if (home / name).is_dir():
+            out.append((label, home / name))
+    if sys.platform.startswith("win"):
+        for c in string.ascii_uppercase:
+            if os.path.exists(f"{c}:\\"):
+                out.append((f"Ổ đĩa {c}:", Path(f"{c}:\\")))
+    else:
+        out.append(("Thư mục gốc  /", Path("/")))
+    return out
+
+
+_FOLDER_ICON = None
+
+
+def folder_icon():
+    global _FOLDER_ICON
+    if _FOLDER_ICON is None:
+        im = Image.new("RGBA", (72, 56), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        d.rounded_rectangle((4, 4, 34, 24), radius=7, fill="#FDBA74")
+        d.rounded_rectangle((4, 14, 68, 52), radius=9, fill="#FB923C")
+        _FOLDER_ICON = ctk.CTkImage(light_image=im, dark_image=im, size=(22, 17))
+    return _FOLDER_ICON
+
+
+class DropZone(tk.Canvas):
+    """Ô tải lên: kéo thả file/thư mục vào, hoặc bấm để chọn file."""
+
+    def __init__(self, master, on_click, dnd=False):
+        super().__init__(master, height=122, bg=CARD, highlightthickness=0, bd=0, cursor="hand2")
+        self.on_click = on_click
+        self.dnd = dnd
+        self.hover = False
+        self.active = False
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Enter>", lambda e: self._hover(True))
+        self.bind("<Leave>", lambda e: self._hover(False))
+        self.bind("<Button-1>", lambda e: self.on_click())
+
+    def _hover(self, on):
+        self.hover = on
+        self.draw()
+
+    def set_active(self, on):
+        if self.active != on:
+            self.active = on
+            self.draw()
+
+    def set_dnd(self, on):
+        self.dnd = on
+        self.draw()
+
+    def _rr(self, x0, y0, x1, y1, r, **kw):
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def draw(self):
+        self.delete("all")
+        w, h = max(self.winfo_width(), 60), max(self.winfo_height(), 60)
+        on = self.active or self.hover
+        self._rr(2, 2, w - 2, h - 2, 16, fill=ORANGE_SOFT if on else "#FFFAF3",
+                 outline=ORANGE if on else "#FDBA74", width=2, dash=(6, 4))
+        cx, y = w / 2, 32
+        kw = dict(fill=ORANGE, width=3, capstyle="round", joinstyle="round")
+        self.create_line(cx, y + 11, cx, y - 12, **kw)                           # thân mũi tên
+        self.create_line(cx - 9, y - 3, cx, y - 12, cx + 9, y - 3, **kw)         # đầu mũi tên
+        self.create_line(cx - 17, y + 3, cx - 17, y + 17, cx + 17, y + 17, cx + 17, y + 3, **kw)  # khay
+        if self.active:
+            t1, t2 = "Thả vào đây để thêm", "File PDF hoặc cả thư mục"
+        elif self.dnd:
+            t1, t2 = "Kéo thả PDF hoặc thư mục vào đây", "hoặc bấm vào ô này để chọn file"
+        else:
+            t1, t2 = "Bấm để chọn file PDF", "Cài tkinterdnd2 để dùng kéo thả"
+        self.create_text(cx, 72, text=t1, fill=TEXT, font=font(13, True), width=w - 24, justify="center")
+        self.create_text(cx, 96, text=t2, fill=MUTED, font=font(11), width=w - 24, justify="center")
+
+
+class FolderPicker(ctk.CTkToplevel):
+    """Hộp chọn thư mục: bấm vào thư mục con để đi vào, có nút tạo thư mục mới."""
+    MAX_ROWS = 300
+
+    def __init__(self, master, title, start=None, confirm="Chọn thư mục này",
+                 allow_new=True, note="", places=(), pick_files=False):
+        super().__init__(master, fg_color=BG)
+        self.title(title)
+        self.minsize(620, 440)
+        self.result = None
+        self.cur = Path.home()
+        self.allow_new = allow_new
+        self.confirm_text = confirm
+        self.note = note
+        self.pick_files = pick_files   # True: chọn nhiều file PDF thay vì chọn thư mục
+        self.selected = set()
+        self._file_vars = {}
+        self.btn_ok = None
+        self.var_path = tk.StringVar()
+        self.var_hidden = tk.BooleanVar(value=False)
+        self.var_new = tk.StringVar()
+        self._new_open = False
+        self._grab_tries = 0
+        self._build(places)
+        w, h = 780, 560
+        self.update_idletasks()
+        x = master.winfo_rootx() + max(0, (master.winfo_width() - w) // 2)
+        y = master.winfo_rooty() + max(0, (master.winfo_height() - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.navigate(start or Path.home(), quiet=True)
+        self.after(150, self._grab)
+
+    # --- dựng giao diện ----------------------------------------------------------
+    def _build(self, places):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        top = ctk.CTkFrame(self, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(14, 8))
+        top.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(top, text="↑", width=34, height=34, corner_radius=8, fg_color=ORANGE_SOFT,
+                      hover_color=ORANGE_SOFT_HOVER, text_color=ORANGE_DARK, font=font(14, True),
+                      command=self.go_up).grid(row=0, column=0, padx=(10, 6), pady=10)
+        self.ent_path = ctk.CTkEntry(top, textvariable=self.var_path, height=34, corner_radius=8,
+                                     border_color=FIELD, fg_color="white", text_color=TEXT, font=font(12))
+        self.ent_path.grid(row=0, column=1, sticky="ew", pady=10, padx=(0, 0 if self.allow_new else 10))
+        self.ent_path.bind("<Return>", lambda e: self.navigate(self.var_path.get()))
+        if self.allow_new:
+            btn_primary(top, "＋ Thư mục mới", self.toggle_new, height=34, width=140).grid(
+                row=0, column=2, padx=10, pady=10)
+
+        side = ctk.CTkFrame(self, fg_color=CARD, corner_radius=14, border_width=1,
+                            border_color=BORDER, width=190)
+        side.grid(row=1, column=0, sticky="ns", padx=(14, 6), pady=(0, 8))
+
+        def header(t):
+            ctk.CTkLabel(side, text=t, font=font(11, True), text_color=MUTED).pack(
+                anchor="w", padx=14, pady=(12, 2))
+
+        def place(label, path):
+            ctk.CTkButton(side, text=shorten(label, 20), anchor="w", height=30, corner_radius=8,
+                          fg_color="transparent", hover_color=ORANGE_SOFT, text_color=TEXT,
+                          font=font(12), command=lambda p=path: self.navigate(p)).pack(
+                fill="x", padx=8, pady=1)
+
+        if places:
+            header("Gần đây")
+            for label, path in places:
+                place(label, path)
+        header("Vị trí")
+        for label, path in default_places():
+            place(label, path)
+        switch(side, "Hiện thư mục ẩn", self.var_hidden, self.refresh).pack(
+            side="bottom", anchor="w", padx=14, pady=12)
+
+        mid = ctk.CTkFrame(self, fg_color="transparent")
+        mid.grid(row=1, column=1, sticky="nsew", padx=(0, 14), pady=(0, 8))
+        mid.grid_rowconfigure(0, weight=1)
+        mid.grid_columnconfigure(0, weight=1)
+        self.listf = ctk.CTkScrollableFrame(mid, fg_color=CARD, corner_radius=14, border_width=1,
+                                            border_color=BORDER, scrollbar_button_color="#E7E5E4",
+                                            scrollbar_button_hover_color="#D6D3D1")
+        self.listf.grid(row=0, column=0, sticky="nsew")
+
+        self.newrow = ctk.CTkFrame(mid, fg_color=CARD, corner_radius=12, border_width=1, border_color=ORANGE)
+        self.newrow.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self.newrow, text="Tên thư mục mới", font=font(12, True), text_color=TEXT).grid(
+            row=0, column=0, padx=(12, 8), pady=10)
+        self.ent_new = ctk.CTkEntry(self.newrow, textvariable=self.var_new, height=32, corner_radius=8,
+                                    border_color=FIELD, fg_color="white", text_color=TEXT, font=font(12),
+                                    placeholder_text="Ví dụ: PDF_da_lam_sach")
+        self.ent_new.grid(row=0, column=1, sticky="ew", pady=10)
+        self.ent_new.bind("<Return>", lambda e: self.create_folder())
+        btn_primary(self.newrow, "Tạo", self.create_folder, height=32, width=64).grid(row=0, column=2, padx=(8, 4))
+        btn_soft(self.newrow, "Đóng", self.toggle_new, height=32, width=64).grid(row=0, column=3, padx=(0, 10))
+
+        self.lbl_err = ctk.CTkLabel(mid, text="", font=font(11), text_color=DANGER, anchor="w", justify="left")
+        self.lbl_err.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+
+        foot = ctk.CTkFrame(self, fg_color="transparent")
+        foot.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 14))
+        foot.grid_columnconfigure(0, weight=1)
+        self.lbl_sel = ctk.CTkLabel(foot, text="", font=font(12), text_color=TEXT, anchor="w",
+                                    justify="left", wraplength=420)
+        self.lbl_sel.grid(row=0, column=0, sticky="ew", padx=(2, 10))
+        btn_soft(foot, "Hủy", self._cancel, height=36, width=80).grid(row=0, column=1, padx=(0, 8))
+        self.btn_ok = btn_primary(foot, self.confirm_text, self._ok, height=36,
+                                  width=max(150, len(self.confirm_text) * 9))
+        self.btn_ok.grid(row=0, column=2)
+
+    # --- điều hướng --------------------------------------------------------------
+    def _err(self, msg, ok=False):
+        self.lbl_err.configure(text=msg, text_color="#15803D" if ok else DANGER)
+
+    def _list_dirs(self, p):
+        names = []
+        show_hidden = self.var_hidden.get()
+        with os.scandir(p) as it:
+            for e in it:
+                try:
+                    if e.is_dir() and (show_hidden or not e.name.startswith(".")):
+                        names.append(e.name)
+                except OSError:
+                    pass
+        return sorted(names, key=str.lower)
+
+    def _list_pdfs(self, p):
+        out = []
+        show_hidden = self.var_hidden.get()
+        with os.scandir(p) as it:
+            for e in it:
+                try:
+                    if (e.is_file() and e.name.lower().endswith(".pdf")
+                            and (show_hidden or not e.name.startswith("."))):
+                        out.append(e.name)
+                except OSError:
+                    pass
+        return sorted(out, key=str.lower)
+
+    def navigate(self, path, quiet=False):
+        p = Path(os.path.abspath(os.path.expanduser(str(path).strip() or str(Path.home()))))
+        msg = ""
+        if not p.is_dir():
+            q = p
+            while not q.is_dir() and q != q.parent:
+                q = q.parent
+            p = q
+            msg = "" if quiet else "Không tìm thấy đường dẫn đó - đã mở thư mục gần nhất."
+        try:
+            names = self._list_dirs(p)
+            files = self._list_pdfs(p) if self.pick_files else []
+        except OSError:
+            self.var_path.set(str(self.cur))
+            self._err("Không có quyền mở thư mục này.")
+            return
+        self.cur = p
+        self.var_path.set(str(p))
+        self._err(msg)
+        self._render(names, files)
+        self._update_footer()
+
+    def refresh(self):
+        self.navigate(self.cur, quiet=True)
+
+    def go_up(self):
+        self.navigate(self.cur.parent, quiet=True)
+
+    def _render(self, names, files=()):
+        for w in self.listf.winfo_children():
+            w.destroy()
+        self._file_vars = {}
+        if files:
+            bar = ctk.CTkFrame(self.listf, fg_color="transparent")
+            bar.pack(fill="x", pady=(2, 6))
+            btn_soft(bar, f"Chọn cả {len(files)} PDF ở đây", self._select_all, height=28).pack(
+                side="left", padx=(0, 6))
+            btn_soft(bar, "Bỏ chọn tất cả", self._select_none, height=28).pack(side="left")
+        if not names and not files:
+            ctk.CTkLabel(self.listf, font=font(12), text_color=MUTED,
+                         text="Thư mục này chưa có thư mục con" + (" hoặc PDF" if self.pick_files else "")
+                         ).pack(pady=30)
+        for n in names[:self.MAX_ROWS]:
+            ctk.CTkButton(self.listf, text=n, image=folder_icon(), compound="left", anchor="w",
+                          height=32, corner_radius=8, fg_color="transparent", hover_color=ORANGE_SOFT,
+                          text_color=TEXT, font=font(13),
+                          command=lambda n=n: self.navigate(self.cur / n, quiet=True)).pack(fill="x", pady=1)
+        for n in files[:self.MAX_ROWS]:
+            path = str(self.cur / n)
+            var = tk.BooleanVar(value=path in self.selected)
+            self._file_vars[path] = var
+            ctk.CTkCheckBox(self.listf, text=f"{shorten(n, 52)}   ({file_size_text(path)})", variable=var,
+                            command=lambda path=path, var=var: self._toggle(path, var),
+                            checkbox_width=20, checkbox_height=20, corner_radius=6, fg_color=ORANGE,
+                            hover_color=ORANGE_HOVER, border_color="#D6D3D1", checkmark_color="white",
+                            text_color=TEXT, font=font(13)).pack(anchor="w", padx=10, pady=5)
+        more = max(0, len(names) - self.MAX_ROWS) + max(0, len(files) - self.MAX_ROWS)
+        if more:
+            ctk.CTkLabel(self.listf, font=font(11), text_color=MUTED,
+                         text=f"… và {more} mục khác (gõ đường dẫn ở trên để vào)").pack(pady=8)
+        try:
+            self.listf._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def _toggle(self, path, var):
+        if var.get():
+            self.selected.add(path)
+        else:
+            self.selected.discard(path)
+        self._update_footer()
+
+    def _select_all(self):
+        for path, var in self._file_vars.items():
+            var.set(True)
+            self.selected.add(path)
+        self._update_footer()
+
+    def _select_none(self):
+        self.selected.clear()
+        for var in self._file_vars.values():
+            var.set(False)
+        self._update_footer()
+
+    def _update_footer(self):
+        if self.pick_files:
+            n = len(self.selected)
+            txt = f"Đang xem: {shorten(str(self.cur), 56)}\n"
+            txt += f"Đã chọn {n} file" if n else "Tích vào các file PDF cần thêm"
+            if self.btn_ok is not None:
+                self.btn_ok.configure(text=f"Thêm {n} file" if n else self.confirm_text,
+                                      state="normal" if n else "disabled")
+        else:
+            txt = f"Đang chọn: {shorten(str(self.cur), 56)}"
+            if self.note:
+                txt += f"\n{self.note}"
+        self.lbl_sel.configure(text=txt)
+
+    # --- tạo thư mục mới ----------------------------------------------------------
+    def toggle_new(self):
+        if self._new_open:
+            self._new_open = False
+            self.newrow.grid_remove()
+            return
+        self._new_open = True
+        self.var_new.set("")
+        self.newrow.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.ent_new.focus_set()
+
+    def create_folder(self):
+        name = self.var_new.get().strip()
+        bad = '<>:"/\\|?*' if sys.platform.startswith("win") else "/"
+        if not name or name in (".", "..") or any(c in name for c in bad):
+            self._err("Tên thư mục không hợp lệ.")
+            return
+        target = self.cur / name
+        if target.exists():
+            self._err("Đã có thư mục hoặc file trùng tên này.")
+            return
+        try:
+            target.mkdir()
+        except OSError as e:
+            self._err(f"Không tạo được thư mục: {e.strerror or e}")
+            return
+        self.toggle_new()
+        self.navigate(target, quiet=True)
+        self._err(f"Đã tạo “{name}” và mở thư mục đó.", ok=True)
+
+    # --- kết thúc -----------------------------------------------------------------
+    def _grab(self):
+        try:
+            self.grab_set()
+            self.lift()
+            self.focus_set()
+        except tk.TclError:
+            self._grab_tries += 1
+            if self._grab_tries < 20:
+                self.after(100, self._grab)
+
+    def _ok(self):
+        if self.pick_files:
+            if not self.selected:
+                return
+            self.result = sorted(self.selected, key=str.lower)
+        else:
+            self.result = str(self.cur)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        self.wait_window(self)
+        return self.result
+
+
+class FileScopeDialog(ctk.CTkToplevel):
+    """Chọn các file sẽ áp dụng một vùng xóa."""
+
+    def __init__(self, master, files, checked):
+        super().__init__(master, fg_color=BG)
+        self.title("Chọn các file áp dụng")
+        self.minsize(440, 400)
+        self.result = None
+        self.vars = {}
+        self._tries = 0
+        ctk.CTkLabel(self, text="Vùng này sẽ được xóa trên các file được tích", font=font(13, True),
+                     text_color=TEXT).pack(anchor="w", padx=16, pady=(16, 8))
+        lst = ctk.CTkScrollableFrame(self, fg_color=CARD, corner_radius=14, border_width=1,
+                                     border_color=BORDER, scrollbar_button_color="#E7E5E4",
+                                     scrollbar_button_hover_color="#D6D3D1")
+        lst.pack(fill="both", expand=True, padx=16)
+        for f in files:
+            var = tk.BooleanVar(value=f in checked)
+            self.vars[f] = var
+            ctk.CTkCheckBox(lst, text=shorten(Path(f).name, 46), variable=var, checkbox_width=20,
+                            checkbox_height=20, corner_radius=6, fg_color=ORANGE, hover_color=ORANGE_HOVER,
+                            border_color="#D6D3D1", checkmark_color="white", text_color=TEXT,
+                            font=font(13)).pack(anchor="w", padx=10, pady=5)
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=16, pady=(10, 14))
+        btn_soft(bar, "Tích hết", lambda: self._set_all(True), height=34, width=80).pack(side="left", padx=(0, 6))
+        btn_soft(bar, "Bỏ hết", lambda: self._set_all(False), height=34, width=80).pack(side="left")
+        btn_primary(bar, "Áp dụng", self._ok, height=34, width=100).pack(side="right")
+        btn_soft(bar, "Hủy", self._cancel, height=34, width=70).pack(side="right", padx=(0, 8))
+        w, h = 460, 460
+        self.update_idletasks()
+        x = master.winfo_rootx() + max(0, (master.winfo_width() - w) // 2)
+        y = master.winfo_rooty() + max(0, (master.winfo_height() - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.after(150, self._grab)
+
+    def _set_all(self, on):
+        for v in self.vars.values():
+            v.set(on)
+
+    def _grab(self):
+        try:
+            self.grab_set()
+            self.lift()
+            self.focus_set()
+        except tk.TclError:
+            self._tries += 1
+            if self._tries < 20:
+                self.after(100, self._grab)
+
+    def _ok(self):
+        self.result = {f for f, v in self.vars.items() if v.get()}
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        self.wait_window(self)
+        return self.result
 
 
 # ----------------------------------------------------------------------------
@@ -926,7 +1421,7 @@ class PageView(ctk.CTkFrame):
 # ỨNG DỤNG
 # ----------------------------------------------------------------------------
 
-class App(ctk.CTk):
+class App(_Root):
     def __init__(self):
         ctk.set_appearance_mode("light")
         super().__init__(fg_color=BG)
@@ -936,13 +1431,18 @@ class App(ctk.CTk):
 
         self.files = []
         self.sel = None
-        self.regions = {}           # đường dẫn file -> list vùng tùy chỉnh
+        self.regions = {}           # đường dẫn file -> list vùng tùy chỉnh (riêng từng file)
+        self.shared = []            # vùng áp dụng cho nhiều file
+        self.region_hist = []       # thứ tự vẽ, để hoàn tác
+        self.file_pick = set()      # file đã chọn cho mục "Chọn file…"
         self.sel_region = None
         self.file_rows = []
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.running = False
         self.last_out_dir = None
+        self.last_dir = str(Path.home())    # thư mục mở gần nhất khi chọn file
+        self.recent_out = []                # các thư mục lưu đã dùng
 
         self.var_wm = tk.BooleanVar(value=True)
         self.var_img = tk.BooleanVar(value=False)
@@ -953,6 +1453,7 @@ class App(ctk.CTk):
         self.var_tool = tk.BooleanVar(value=False)
         self.var_scope = tk.StringVar(value="Chỉ trang này")
         self.var_range = tk.StringVar(value="")
+        self.var_fscope = tk.StringVar(value="Chỉ file này")
         self.var_out_mode = tk.StringVar(value="beside")
         self.var_out = tk.StringVar(value="")
 
@@ -966,6 +1467,9 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._render_files()
         self._render_regions()
+        self.var_out.trace_add("write", lambda *a: self._update_out_hint())
+        self._update_out_hint()
+        self._setup_dnd()
         self.after(100, self._poll)
 
     # --- dựng giao diện --------------------------------------------------------
@@ -997,10 +1501,13 @@ class App(ctk.CTk):
 
         # 1. File
         c1 = self._card("1 · Tệp PDF")
-        bar = ctk.CTkFrame(c1, fg_color="transparent")
-        bar.pack(fill="x", padx=16)
-        btn_primary(bar, "＋ Thêm PDF", self.add_files, height=34).pack(side="left", expand=True, fill="x", padx=(0, 5))
-        btn_soft(bar, "Thêm thư mục", self.add_folder, height=34).pack(side="left", expand=True, fill="x")
+        self.zone = DropZone(c1, on_click=self.add_files, dnd=HAS_DND)
+        self.zone.pack(fill="x", padx=16)
+        zrow = ctk.CTkFrame(c1, fg_color="transparent")
+        zrow.pack(fill="x", padx=16, pady=(6, 0))
+        self.lbl_add = ctk.CTkLabel(zrow, text="", font=font(11), text_color=MUTED, anchor="w",
+                                    justify="left", wraplength=320)
+        self.lbl_add.pack(side="left", fill="x", expand=True)
         self.file_list = ctk.CTkScrollableFrame(c1, height=150, fg_color="#FAFAF9", corner_radius=12,
                                                 scrollbar_button_color="#E7E5E4",
                                                 scrollbar_button_hover_color="#D6D3D1")
@@ -1037,7 +1544,7 @@ class App(ctk.CTk):
 
         # 3. Vùng tùy chỉnh
         c3 = self._card("3 · Xóa vùng tùy chỉnh",
-                        "Kéo chuột trên trang xem trước để chọn vùng. Mỗi vùng gắn riêng với từng file.")
+                        "Kéo chuột trên trang xem trước để chọn vùng. Có thể áp dụng cho nhiều trang và nhiều file cùng lúc.")
         b3 = ctk.CTkFrame(c3, fg_color="transparent")
         b3.pack(fill="x", padx=16, pady=(0, 14))
         self.btn_tool = ctk.CTkButton(b3, text="✂  Bật chế độ vẽ vùng", height=38, corner_radius=10,
@@ -1055,10 +1562,24 @@ class App(ctk.CTk):
                                            dropdown_fg_color="white", dropdown_hover_color=ORANGE_SOFT,
                                            dropdown_text_color=TEXT, font=font(12), dropdown_font=font(12))
         self.opt_scope.pack(side="right")
+        row_f = ctk.CTkFrame(b3, fg_color="transparent")
+        row_f.pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(row_f, text="Áp dụng cho file", font=font(12), text_color=TEXT).pack(side="left")
+        self.opt_fscope = ctk.CTkOptionMenu(row_f, values=list(FILE_SCOPES), variable=self.var_fscope,
+                                            command=self._on_fscope, corner_radius=10, height=30,
+                                            fg_color=ORANGE_SOFT, button_color=ORANGE,
+                                            button_hover_color=ORANGE_HOVER, text_color=TEXT,
+                                            dropdown_fg_color="white", dropdown_hover_color=ORANGE_SOFT,
+                                            dropdown_text_color=TEXT, font=font(12), dropdown_font=font(12))
+        self.opt_fscope.pack(side="right")
+        self.row_f = row_f
+        self.lbl_fpick = ctk.CTkLabel(b3, text="", font=font(11, True, underline=True),
+                                      text_color=ORANGE_DARK, cursor="hand2", anchor="w")
+        self.lbl_fpick.bind("<Button-1>", lambda e: self._pick_files())
         self.ent_range = ctk.CTkEntry(b3, textvariable=self.var_range, height=30, corner_radius=8,
                                       border_color=FIELD, fg_color="white", text_color=TEXT,
                                       placeholder_text="Ví dụ: 1-5, 8, 10-", font=font(12))
-        ctk.CTkLabel(b3, text="Các vùng của file đang chọn", font=font(12, True),
+        ctk.CTkLabel(b3, text="Các vùng áp dụng cho file đang chọn", font=font(12, True),
                      text_color=MUTED).pack(anchor="w", pady=(12, 4))
         self.reg_list = ctk.CTkScrollableFrame(b3, height=110, fg_color="#FAFAF9", corner_radius=12,
                                                scrollbar_button_color="#E7E5E4",
@@ -1076,11 +1597,17 @@ class App(ctk.CTk):
         self.seg_out = segmented(b4, ["Cạnh file gốc", "Thư mục khác"], self._on_out_mode, "Cạnh file gốc")
         self.seg_out.pack(fill="x")
         self.out_row = ctk.CTkFrame(b4, fg_color="transparent")
-        self.ent_out = ctk.CTkEntry(self.out_row, textvariable=self.var_out, height=32, corner_radius=8,
-                                    border_color=FIELD, fg_color="white", text_color=TEXT,
-                                    placeholder_text="Chọn thư mục lưu…", font=font(12))
+        orow = ctk.CTkFrame(self.out_row, fg_color="transparent")
+        orow.pack(fill="x")
+        self.ent_out = ctk.CTkEntry(orow, textvariable=self.var_out, height=34, corner_radius=8,
+                                    border_color=FIELD, fg_color="white", text_color=TEXT, font=font(12),
+                                    placeholder_text="Chọn hoặc kéo thả thư mục…" if HAS_DND
+                                    else "Chọn thư mục lưu…")
         self.ent_out.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        btn_soft(self.out_row, "Chọn…", self.pick_out, height=32, width=70).pack(side="left")
+        btn_soft(orow, "Chọn…", self.pick_out, height=34, width=76).pack(side="left")
+        self.lbl_out_hint = ctk.CTkLabel(self.out_row, text="", font=font(11), text_color=MUTED,
+                                         anchor="w", justify="left", wraplength=320)
+        self.lbl_out_hint.pack(fill="x", pady=(4, 0))
         ctk.CTkLabel(b4, text="Tên file kết quả: <tên gốc>_clean.pdf", font=font(11),
                      text_color=MUTED).pack(anchor="w", pady=(8, 8))
         self.btn_run = btn_primary(b4, "▶  Làm sạch tất cả", self.run, height=42)
@@ -1188,7 +1715,7 @@ class App(ctk.CTk):
             "footer": self.var_f.get(),
             "img": self.var_img.get(),
             "fill": self.var_fill.get(),
-            "regions": list(self.regions.get(path, [])) if path else [],
+            "regions": self.regions_for(path),
         }
 
     def cur_path(self):
@@ -1256,21 +1783,74 @@ class App(ctk.CTk):
 
     # --- quản lý file ----------------------------------------------------------
     def add_files(self):
-        for f in filedialog.askopenfilenames(filetypes=[("PDF", "*.pdf")]):
-            self._add(f)
-        self._after_add()
+        res = FolderPicker(self, "Chọn file PDF", start=self.last_dir, confirm="Thêm file",
+                           allow_new=False, pick_files=True, places=self._recent_places()).show()
+        if res:
+            self.add_paths(res)
 
     def add_folder(self):
-        d = filedialog.askdirectory()
+        d = FolderPicker(self, "Thêm thư mục chứa PDF", start=self.last_dir,
+                         confirm="Thêm PDF trong thư mục này", allow_new=False,
+                         note="Sẽ thêm mọi PDF trong thư mục này và các thư mục con.",
+                         places=self._recent_places()).show()
         if d:
-            for f in sorted(Path(d).glob("*.pdf")):
-                self._add(str(f))
-            self._after_add()
+            self.add_paths([d])
+
+    def _scan_dir(self, d, limit=2000):
+        """Mọi PDF trong thư mục (gồm thư mục con); bỏ qua file *_clean.pdf do chính tool xuất ra."""
+        out = []
+        for root, dirs, files in os.walk(d):
+            dirs[:] = sorted(x for x in dirs if not x.startswith("."))
+            for name in sorted(files):
+                low = name.lower()
+                if low.endswith(".pdf") and not low.endswith("_clean.pdf"):
+                    out.append(Path(root) / name)
+                    if len(out) >= limit:
+                        return out
+        return out
+
+    def add_paths(self, paths):
+        """Nhận file và thư mục từ nút chọn hoặc kéo thả."""
+        found, skipped = [], 0
+        for raw in paths:
+            p = Path(str(raw).strip())
+            try:
+                if p.is_dir():
+                    self.last_dir = str(p)
+                    found.extend(self._scan_dir(p))
+                elif p.is_file() and p.suffix.lower() == ".pdf":
+                    self.last_dir = str(p.parent)
+                    found.append(p)
+                else:
+                    skipped += 1
+            except OSError:
+                skipped += 1
+        added = dup = 0
+        for f in found:
+            if self._add(f):
+                added += 1
+            else:
+                dup += 1
+        if not found:
+            msg = "Không tìm thấy file PDF nào."
+        else:
+            parts = []
+            if added:
+                parts.append(f"Đã thêm {added} file")
+            if dup:
+                parts.append(f"{dup} file đã có")
+            if skipped:
+                parts.append(f"bỏ qua {skipped} mục khác")
+            msg = " · ".join(parts)
+        self.lbl_add.configure(text=msg, text_color=ORANGE_DARK if added else MUTED)
+        self._after_add()
 
     def _add(self, f):
         f = str(Path(f))
-        if f not in self.files:
-            self.files.append(f)
+        if f in self.files:
+            return False
+        self.files.append(f)
+        return True
 
     def _after_add(self):
         self._render_files()
@@ -1297,6 +1877,7 @@ class App(ctk.CTk):
             return
         path = self.files.pop(i)
         self.regions.pop(path, None)
+        self._prune_shared()
         if self.sel is None:
             pass
         elif i < self.sel:
@@ -1316,6 +1897,8 @@ class App(ctk.CTk):
     def clear_files(self):
         self.files.clear()
         self.regions.clear()
+        self.shared.clear()
+        self.region_hist.clear()
         self.sel = None
         self._render_files()
         self.select(None)
@@ -1333,17 +1916,19 @@ class App(ctk.CTk):
                                border_color="#F5F5F4", height=34)
             row.pack(fill="x", pady=2)
             name = Path(path).name
-            if len(name) > 30:
-                name = name[:27] + "…"
+            if len(name) > 24:
+                name = name[:21] + "…"
             lab = ctk.CTkLabel(row, text=name, anchor="w", font=font(12), text_color=TEXT)
             lab.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=6)
+            size = ctk.CTkLabel(row, text=file_size_text(path), font=font(10), text_color=MUTED)
+            size.pack(side="left", padx=2)
             badge = ctk.CTkLabel(row, text="", font=font(10, True), text_color=ORANGE_DARK)
             badge.pack(side="left", padx=2)
             x = ctk.CTkButton(row, text="✕", width=24, height=24, corner_radius=8, fg_color="transparent",
                               hover_color="#FECACA", text_color=MUTED, font=font(11, True),
                               command=lambda i=i: self.remove_file(i))
             x.pack(side="right", padx=(0, 6))
-            for wdg in (row, lab, badge):
+            for wdg in (row, lab, size, badge):
                 wdg.bind("<Button-1>", lambda e, i=i: self.select(i))
             self.file_rows.append((row, badge))
         self._highlight_files()
@@ -1357,7 +1942,7 @@ class App(ctk.CTk):
 
     def _update_badges(self):
         for i, (_, badge) in enumerate(self.file_rows):
-            k = len(self.regions.get(self.files[i], []))
+            k = len(self.regions_for(self.files[i]))
             badge.configure(text=f"✂ {k}" if k else "")
 
     # --- vùng tùy chỉnh --------------------------------------------------------
@@ -1378,6 +1963,60 @@ class App(ctk.CTk):
         else:
             self.ent_range.pack_forget()
 
+    def regions_for(self, path):
+        """Vùng áp dụng cho file: vùng riêng + vùng dùng chung nhiều file."""
+        if not path:
+            return []
+        shared = [r for r in self.shared if r["files"] == "all" or path in r["files"]]
+        return list(self.regions.get(path, [])) + shared
+
+    def _drop_rg(self, rg):
+        for lst in self.regions.values():
+            lst[:] = [r for r in lst if r is not rg]
+        self.shared = [r for r in self.shared if r is not rg]
+
+    def _prune_shared(self):
+        """Bỏ file đã xóa khỏi các vùng dùng chung; vùng không còn file nào thì xóa."""
+        keep = []
+        for r in self.shared:
+            if r["files"] == "all":
+                keep.append(r)
+                continue
+            left = frozenset(x for x in r["files"] if x in self.files)
+            if left:
+                r["files"] = left
+                keep.append(r)
+        self.shared = keep
+
+    def _file_tag(self, rg):
+        f = rg.get("files", "this")
+        if f == "all":
+            return "mọi file"
+        if f == "this":
+            return ""
+        return f"{len(f)} file"
+
+    def _on_fscope(self, label):
+        if FILE_SCOPES[label] == "pick":
+            self._pick_files(first=True)
+        else:
+            self.lbl_fpick.pack_forget()
+
+    def _pick_files(self, first=False):
+        cur = self.cur_path()
+        checked = {f for f in self.file_pick if f in self.files}
+        if cur:
+            checked.add(cur)
+        res = FileScopeDialog(self, self.files, checked).show()
+        if res is None or not res:
+            if first and not self.file_pick:
+                self.var_fscope.set("Chỉ file này")
+                self.lbl_fpick.pack_forget()
+            return
+        self.file_pick = set(res)
+        self.lbl_fpick.configure(text=f"{len(res)} file được chọn · bấm để đổi")
+        self.lbl_fpick.pack(anchor="w", pady=(4, 0), after=self.row_f)
+
     def add_region(self, pno, fr):
         path = self.cur_path()
         if not path:
@@ -1396,9 +2035,21 @@ class App(ctk.CTk):
                                        "Chưa nhập khoảng trang hoặc nằm ngoài số trang của file.")
                 return
             rg["pages"] = frozenset(pages)
-        lst = self.regions.setdefault(path, [])
-        lst.append(rg)
-        self.sel_region = len(lst) - 1
+        fkey = FILE_SCOPES[self.var_fscope.get()]
+        if fkey == "this":
+            rg["files"] = "this"
+            self.regions.setdefault(path, []).append(rg)
+        elif fkey == "all":
+            rg["files"] = "all"
+            self.shared.append(rg)
+        else:
+            pick = {f for f in self.file_pick if f in self.files} | {path}
+            if len(pick) < 1:
+                return
+            rg["files"] = frozenset(pick)
+            self.shared.append(rg)
+        self.region_hist.append(rg)
+        self.sel_region = next((i for i, r in enumerate(self.regions_for(path)) if r is rg), None)
         self._render_regions()
         self._update_badges()
         self.view.request_refresh()
@@ -1422,7 +2073,7 @@ class App(ctk.CTk):
         for w in self.reg_list.winfo_children():
             w.destroy()
         path = self.cur_path()
-        lst = self.regions.get(path, []) if path else []
+        lst = self.regions_for(path)
         if not lst:
             ctk.CTkLabel(self.reg_list, text="Chưa có vùng nào", font=font(12),
                          text_color=MUTED).pack(pady=14)
@@ -1440,12 +2091,18 @@ class App(ctk.CTk):
             ctk.CTkButton(row, text="✕", width=24, height=24, corner_radius=8, fg_color="transparent",
                           hover_color="#FECACA", text_color=MUTED, font=font(11, True),
                           command=lambda i=i: self.remove_region(i)).pack(side="right", padx=(0, 6))
-            for wdg in (row, lab):
+            wl = [row, lab]
+            tag = self._file_tag(rg)
+            if tag:
+                tl = ctk.CTkLabel(row, text=tag, font=font(10, True), text_color=ORANGE_DARK)
+                tl.pack(side="right", padx=2)
+                wl.append(tl)
+            for wdg in wl:
                 wdg.bind("<Button-1>", lambda e, i=i: self.select_region(i))
 
     def select_region(self, i):
         path = self.cur_path()
-        lst = self.regions.get(path, []) if path else []
+        lst = self.regions_for(path)
         if not (0 <= i < len(lst)):
             return
         self.sel_region = i
@@ -1457,10 +2114,10 @@ class App(ctk.CTk):
 
     def remove_region(self, i):
         path = self.cur_path()
-        lst = self.regions.get(path, []) if path else []
+        lst = self.regions_for(path)
         if not (0 <= i < len(lst)):
             return
-        lst.pop(i)
+        self._drop_rg(lst[i])
         self.sel_region = None
         self._render_regions()
         self._update_badges()
@@ -1469,19 +2126,40 @@ class App(ctk.CTk):
 
     def undo_region(self):
         path = self.cur_path()
-        lst = self.regions.get(path, []) if path else []
+        lst = self.regions_for(path)
+        while self.region_hist:
+            rg = self.region_hist.pop()
+            for i, r in enumerate(lst):
+                if r is rg:
+                    self.remove_region(i)
+                    return
         if lst:
             self.remove_region(len(lst) - 1)
 
     def clear_regions(self):
         path = self.cur_path()
-        if path and self.regions.get(path):
-            self.regions[path] = []
-            self.sel_region = None
-            self._render_regions()
-            self._update_badges()
-            self.view.request_refresh()
-            self.view.sched_redraw()
+        lst = self.regions_for(path)
+        if not lst:
+            return
+        own = self.regions.get(path, [])
+        shared = [r for r in lst if not any(r is o for o in own)]
+        if shared:
+            ans = messagebox.askyesnocancel(
+                "Xóa hết vùng",
+                f"Có {len(shared)} vùng đang áp dụng cho nhiều file.\n\n"
+                "Có: xóa luôn các vùng đó khỏi mọi file\n"
+                "Không: chỉ xóa các vùng riêng của file này")
+            if ans is None:
+                return
+            if ans:
+                for r in shared:
+                    self._drop_rg(r)
+        self.regions[path] = []
+        self.sel_region = None
+        self._render_regions()
+        self._update_badges()
+        self.view.request_refresh()
+        self.view.sched_redraw()
 
     def _on_delete_key(self, _=None):
         w = self.focus_get()
@@ -1495,14 +2173,44 @@ class App(ctk.CTk):
         if label == "Thư mục khác":
             self.var_out_mode.set("folder")
             self.out_row.pack(fill="x", pady=(8, 0), after=self.seg_out)
+            self._update_out_hint()
+            if not self.var_out.get().strip():
+                self.after(80, self.pick_out)   # chưa chọn nơi lưu: mở luôn hộp chọn
         else:
             self.var_out_mode.set("beside")
             self.out_row.pack_forget()
 
     def pick_out(self):
-        d = filedialog.askdirectory()
+        cur = self.var_out.get().strip()
+        start = os.path.expanduser(cur) if cur else (self.last_out_dir or self.last_dir)
+        d = FolderPicker(self, "Chọn nơi lưu kết quả", start=start, confirm="Lưu vào thư mục này",
+                         allow_new=True, places=self._recent_places()).show()
         if d:
-            self.var_out.set(d)
+            self._set_out(d)
+
+    def _set_out(self, d):
+        self.var_out.set(str(d))
+        self._remember(d)
+
+    def _remember(self, d):
+        d = str(d)
+        if d in self.recent_out:
+            self.recent_out.remove(d)
+        self.recent_out.insert(0, d)
+        del self.recent_out[4:]
+
+    def _recent_places(self):
+        return [(Path(d).name or d, d) for d in self.recent_out if os.path.isdir(d)]
+
+    def _update_out_hint(self):
+        t = self.var_out.get().strip()
+        if not t:
+            txt, col = "Chưa chọn nơi lưu.", MUTED
+        elif os.path.isdir(os.path.expanduser(t)):
+            txt, col = "Sẽ lưu kết quả vào thư mục này.", "#15803D"
+        else:
+            txt, col = "Thư mục này chưa có - sẽ tự tạo khi xuất.", ORANGE_DARK
+        self.lbl_out_hint.configure(text=txt, text_color=col)
 
     def run(self):
         if self.running:
@@ -1518,6 +2226,8 @@ class App(ctk.CTk):
             if not out:
                 messagebox.showinfo("Thông báo", "Hãy chọn thư mục lưu kết quả.")
                 return
+            out = os.path.expanduser(out)
+            self._remember(out)
         jobs = [(f, self.opts(f)) for f in self.files]
         self.cancel.clear()
         self.running = True
@@ -1531,11 +2241,17 @@ class App(ctk.CTk):
         ok = err = 0
         last = None
         total = len(jobs)
+        used = set()   # tránh hai file trùng tên đè lên nhau trong cùng lần xuất
         for i, (src, opts) in enumerate(jobs):
             if self.cancel.is_set():
                 break
             p = Path(src)
-            dst = (Path(out) if out else p.parent) / f"{p.stem}_clean.pdf"
+            base = (Path(out) if out else p.parent) / f"{p.stem}_clean.pdf"
+            dst, k = base, 2
+            while str(dst).lower() in used:
+                dst = base.with_name(f"{p.stem}_clean ({k}).pdf")
+                k += 1
+            used.add(str(dst).lower())
 
             def cb(done, n, i=i):
                 self.q.put(("prog", (i + done / n) / total))
@@ -1592,6 +2308,64 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
         self.after(100, self._poll)
+
+    # --- kéo thả ---------------------------------------------------------------
+    def _setup_dnd(self):
+        self.dnd_on = bool(HAS_DND and self.dnd_ok)
+        self.zone.set_dnd(self.dnd_on)
+        if not self.dnd_on:
+            return
+
+        def reg(w, drop, enter=None, leave=None):
+            if w is None:
+                return
+            try:
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", drop)
+                w.dnd_bind("<<DropEnter>>", enter or self._dnd_enter)
+                w.dnd_bind("<<DropLeave>>", leave or self._dnd_leave)
+            except Exception:
+                pass
+
+        for w in (self, self.side, getattr(self.side, "_parent_canvas", None), self.zone,
+                  self.file_list, getattr(self.file_list, "_parent_canvas", None),
+                  self.view, self.view.canvas):
+            reg(w, self._on_drop)
+        for w in (self.ent_out, getattr(self.ent_out, "_entry", None)):
+            reg(w, self._on_drop_out, self._dnd_keep, self._dnd_keep)
+
+    def _dnd_enter(self, event):
+        self.zone.set_active(True)
+        return event.action
+
+    def _dnd_leave(self, event):
+        self.zone.set_active(False)
+        return event.action
+
+    def _dnd_keep(self, event):
+        return event.action
+
+    def _drop_paths(self, event):
+        try:
+            return list(self.tk.splitlist(event.data))
+        except Exception:
+            return [event.data]
+
+    def _on_drop(self, event):
+        self.zone.set_active(False)
+        self.add_paths(self._drop_paths(event))
+        return event.action
+
+    def _on_drop_out(self, event):
+        for raw in self._drop_paths(event):
+            p = Path(raw)
+            d = p if p.is_dir() else p.parent
+            if d.is_dir():
+                self._set_out(d)
+                self.seg_out.set("Thư mục khác")
+                self._on_out_mode("Thư mục khác")
+                break
+        return event.action
 
     def _on_close(self):
         self.cancel.set()
