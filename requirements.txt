@@ -3,6 +3,5 @@ PyMuPDF>=1.24
 # Tkinter (giao diện GUI) — không cài qua pip, là package hệ thống:
 #   - Windows / macOS: đã có sẵn trong Python
 #   - Ubuntu / Debian:  sudo apt install python3-tk
-#   - Fedora / RHEL:    sudo dnf install python3-tkinter
-#   - Arch Linux:       sudo pacman -S tk
-#   - openSUSE:         sudo zypper install python3-tk
+
+
