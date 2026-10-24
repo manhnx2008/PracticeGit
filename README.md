@@ -1,42 +1,92 @@
-# PDF Sạch
+# PDF Cleaner
 
-Ứng dụng desktop một file dùng PyMuPDF + PySide6 để loại bỏ header, footer, watermark dạng ảnh và vùng tùy chọn trong PDF.
+Công cụ gỡ **logo chìm (watermark)**, **header** và **footer** khỏi file PDF — giữ nguyên định dạng PDF, không cần chuyển sang Word.
 
-## Chạy
+Hỗ trợ cả **PDF scan** (mỗi trang là một ảnh): bật tùy chọn "Xóa cả vùng ảnh" rồi cắt theo % trang.
+
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+---
+
+## ✨ Tính năng
+
+| Tính năng | Mô tả |
+|---|---|
+| **Gỡ logo chìm** | Tự động phát hiện ảnh lớn lặp lại ở ≥ 60% số trang và xóa |
+| **Xóa header/footer tự động** | Nhận diện chữ lặp lại ở vùng 12% trên/dưới trang |
+| **Xóa header/footer thủ công** | Cắt theo % tùy chỉnh (0–15%) từ mép trên/dưới |
+| **Hỗ trợ PDF scan** | Tô trắng pixel ảnh trong vùng bị xóa |
+| **Xem trước** | Preview kết quả trước khi xử lý, khung đỏ đánh dấu vùng sẽ bị xóa |
+| **Xử lý hàng loạt** | Chọn nhiều file hoặc cả thư mục, chạy một lần |
+
+## 📦 Cài đặt
+
+### Yêu cầu hệ thống
+
+- **Python** ≥ 3.8
+- **Tkinter** (có sẵn trên Windows/macOS)
+  - Linux cần cài thêm:
+
+  | Distro | Lệnh cài |
+  |---|---|
+  | Ubuntu / Debian | `sudo apt install python3-tk` |
+  | Fedora / RHEL | `sudo dnf install python3-tkinter` |
+  | Arch Linux | `sudo pacman -S tk` |
+  | openSUSE | `sudo zypper install python3-tk` |
+
+### Cài thư viện
 
 ```bash
-uv venv .venv
-uv pip install --python .venv/bin/python -r requirements.txt
-.venv/bin/python pdf_cleaner.py
-```
-
-Hoặc nếu hệ thống đã cài `python3-venv`:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-python pdf_cleaner.py
 ```
 
-## Tính năng
+Hoặc cài trực tiếp:
 
-- Xem trước từng trang và chọn vùng bằng kéo chuột.
-- Redact header/footer bằng dải lề tùy chỉnh (3-25%).
-- Dò và redact ảnh watermark có alpha hoặc ảnh nhỏ trên trang.
-- Xử lý hàng loạt; đầu ra nằm trong `pdf_sach_output/`.
-- Không ghi đè tệp gốc.
+```bash
+pip install "PyMuPDF>=1.24"
+```
 
-## Giao diện
+## 🚀 Sử dụng
 
-- Màu cam làm tone chủ đạo, thiết kế gọn nhẹ với sidebar và canvas preview.
-- Nút bấm bo tròn, font Segoe UI, tương phản cao.
-- Điều chỉnh cửa sổ tự động render lại preview.
+```bash
+python pdf_cleaner-2.py
+```
 
-## Lưu ý
+### Hướng dẫn nhanh
 
-Watermark dạng ảnh được phát hiện theo heuristic bảo thủ: ảnh có alpha hoặc chiếm dưới 38% diện tích trang. Các watermark không có alpha hoặc dùng nội dung vector có thể cần dùng Chọn vùng.
+1. **Chọn file** — Nhấn "Thêm PDF..." hoặc "Thêm thư mục..." để thêm file cần xử lý.
+2. **Tùy chỉnh** — Chọn các tùy chọn:
+   - ☑ Gỡ logo chìm (ảnh lớn lặp ở nhiều trang)
+   - ☑ Xóa cả vùng ảnh (dành cho PDF scan)
+   - ◉ Header/footer: tự nhận diện chữ lặp lại **hoặc** cắt theo % trang
+   - Thanh trượt điều chỉnh % cắt header/footer (chế độ thủ công)
+3. **Xem trước** — Chọn file trong danh sách để preview. Khung đỏ = vùng sẽ bị xóa.
+4. **Xuất** — Chọn thư mục đầu ra (hoặc để trống → lưu cạnh file gốc với hậu tố `_clean`). Nhấn **"▶ Làm sạch tất cả"**.
 
-## Xuất desktop app
+## ⚙️ Cấu hình mặc định
 
-Dùng PyInstaller hoặc Nuitka để đóng gói thành `.exe` (Windows) hoặc `.app` (macOS) cho việc dùng hàng ngày. Tệp đơn có thể di chuyển, không cần cài Python riêng.
+| Tham số | Giá trị | Ý nghĩa |
+|---|---|---|
+| `WM_MIN_AREA` | 0.15 | Ảnh chiếm ≥ 15% diện tích trang → ứng viên logo chìm |
+| `WM_MIN_PAGES` | 0.6 | Xuất hiện ở ≥ 60% số trang → xác nhận là logo chìm |
+| `HF_ZONE` | 0.12 | Vùng quét header/footer: 12% trên + 12% dưới |
+| `HF_MIN_PAGES` | 0.6 | Chữ lặp ở ≥ 60% số trang = header/footer |
+| `FILL_COLOR` | `(1, 1, 1)` | Màu tô vùng bị xóa (trắng) |
+
+Có thể chỉnh trực tiếp trong đầu file `pdf_cleaner-2.py`.
+
+## 📁 Cấu trúc dự án
+
+```
+Tool/
+├── pdf_cleaner-2.py   # Script chính (GUI + logic xử lý)
+├── requirements.txt   # Thư viện cần thiết
+└── README.md          # Tài liệu này
+```
+
+## 📝 Ghi chú
+
+- File đầu ra giữ nguyên định dạng PDF, **không** chuyển sang ảnh hay Word.
+- Với PDF chỉ có 1 trang, chế độ tự nhận diện header/footer sẽ không xóa gì (vì không có gì để so sánh lặp lại).
+- Chế độ "Xóa cả vùng ảnh" dành cho PDF scan — tô trắng pixel ảnh bên trong vùng redact.
