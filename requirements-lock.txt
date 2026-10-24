@@ -1,7 +1,0 @@
-pymupdf==2.0
-pyside6==6.12.0
-pyside6-addons==6.12.0
-pyside6-essentials==6.12.0
-pyside6-pdf==6.12.0.140
-pyside6-webengine==6.12.0.140
-shiboken6==6.12.0
